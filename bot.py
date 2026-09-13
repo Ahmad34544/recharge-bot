@@ -6,17 +6,18 @@ import telebot
 from telebot import types
 
 # ----------------- الإعدادات الأساسية -----------------
+# ضع التوكن الخاص بك والآيدي هنا
 TOKEN = os.getenv("BOT_TOKEN", "8727422134:AAGHpvx-B2iqIRRswcX8e8xEPMLYb5vNDxc")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8176761013"))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# --- سيرفر وهمي صغير لإبقاء الاستضافة السحابية متصلة 24/7 ---
+# --- سيرفر وهمي لإبقاء الاستضافة السحابية متصلة 24/7 ---
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is Running 24/7 Successfully!")
+        self.wfile.write(b"Revix Pro Bot Running 24/7!")
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
@@ -25,335 +26,407 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# ----------------- إعداد قاعدة البيانات -----------------
+# ----------------- قاعدة البيانات -----------------
 def get_db():
-    conn = sqlite3.connect("bot_database.db")
+    conn = sqlite3.connect("store_data.db", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        c = conn.cursor()
+        # المستخدمين
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
+            username TEXT,
             balance REAL DEFAULT 0.0,
-            currency TEXT DEFAULT 'USD'
+            currency TEXT DEFAULT 'USD',
+            is_banned INTEGER DEFAULT 0
         )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS categories (
+        # الأقسام
+        c.execute('''CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL
         )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS products (
+        # المنتجات
+        c.execute('''CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category_id INTEGER,
             name TEXT NOT NULL,
             price REAL NOT NULL,
-            api_service_id TEXT DEFAULT '',
-            FOREIGN KEY (category_id) REFERENCES categories (id)
+            input_hint TEXT DEFAULT 'معرف اللاعب (ID)'
         )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS payment_methods (
+        # طرق الدفع
+        c.execute('''CREATE TABLE IF NOT EXISTS payment_methods (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            instructions TEXT NOT NULL
+            details TEXT NOT NULL
         )''')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+        # الطلبات
+        c.execute('''CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT, -- deposit أو charge
+            item_name TEXT,
+            target_id TEXT,
+            amount REAL,
+            status TEXT DEFAULT 'pending' -- pending, completed, failed
         )''')
-        cursor.execute("INSERT OR IGNORE INTO settings VALUES ('support_url', 'https://t.me/telegram')")
-        cursor.execute("INSERT OR IGNORE INTO settings VALUES ('news_url', 'https://t.me/telegram')")
+        # الإعدادات وأسعار الصرف
+        c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+        c.execute("INSERT OR IGNORE INTO settings VALUES ('support_url', 'https://t.me/telegram')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES ('news_url', 'https://t.me/telegram')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES ('rate_USD', '1.0')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES ('rate_SYP', '15000.0')")
+        c.execute("INSERT OR IGNORE INTO settings VALUES ('rate_SAR', '3.75')")
         conn.commit()
 
 init_db()
 
-def get_user(user_id):
+def get_user(user_id, username=""):
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            cursor.execute("INSERT INTO users (user_id, balance, currency) VALUES (?, 0.0, 'USD')", (user_id,))
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        u = c.fetchone()
+        if not u:
+            c.execute("INSERT INTO users (user_id, username, balance, currency) VALUES (?, ?, 0.0, 'USD')", (user_id, username))
             conn.commit()
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            user = cursor.fetchone()
-        return user
+            c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            u = c.fetchone()
+        return u
 
-# ----------------- لوحات المفاتيح -----------------
-
-def main_menu():
+def get_setting(key, default=""):
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = 'support_url'")
-        support_url = cursor.fetchone()[0]
-        cursor.execute("SELECT value FROM settings WHERE key = 'news_url'")
-        news_url = cursor.fetchone()[0]
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        res = c.fetchone()
+        return res[0] if res else default
 
+def convert_currency(amount_usd, target_currency):
+    rate = float(get_setting(f"rate_{target_currency}", 1.0))
+    return amount_usd * rate
+
+# ----------------- لوحات المفاتيح (Keyboards) -----------------
+
+def user_main_markup():
+    support_url = get_setting('support_url')
+    news_url = get_setting('news_url')
     markup = types.InlineKeyboardMarkup(row_width=2)
-    b_shop = types.InlineKeyboardButton("🛍 تسوق في متجرنا", callback_data="user_shop")
-    b_deposit = types.InlineKeyboardButton("💰 إيداع رصيد", callback_data="user_deposit")
-    b_account = types.InlineKeyboardButton("👤 حسابي الشخصي", callback_data="user_account")
-    b_currency = types.InlineKeyboardButton("🌐 تغيير العملة", callback_data="user_currency")
-    b_support = types.InlineKeyboardButton("🛠 الدعم الفني", url=support_url)
+    b_shop = types.InlineKeyboardButton("🛍 تسوق في متجرنا", callback_data="u_shop")
+    b_deposit = types.InlineKeyboardButton("💰 إيداع رصيد", callback_data="u_deposit")
+    b_acc = types.InlineKeyboardButton("👤 حسابي الشخصي", callback_data="u_acc")
+    b_curr = types.InlineKeyboardButton("🌐 تغيير العملة", callback_data="u_curr")
+    b_sup = types.InlineKeyboardButton("🛠 الدعم الفني", url=support_url)
     b_news = types.InlineKeyboardButton("📢 أخبار البوت", url=news_url)
-
+    
     markup.add(b_shop)
-    markup.add(b_deposit, b_account)
-    markup.add(b_currency)
-    markup.add(b_support, b_news)
+    markup.add(b_deposit, b_acc)
+    markup.add(b_curr)
+    markup.add(b_sup, b_news)
     return markup
 
-def admin_panel():
+def admin_main_markup():
     markup = types.InlineKeyboardMarkup(row_width=2)
-    b_orders = types.InlineKeyboardButton("📦 الطلبات", callback_data="admin_orders")
-    b_finance = types.InlineKeyboardButton("💰 إدارة الأرصدة", callback_data="admin_finance")
-    b_products = types.InlineKeyboardButton("🛍 إدارة الأقسام والمنتجات", callback_data="admin_manage_shop")
-    b_methods = types.InlineKeyboardButton("💳 طرق الإيداع", callback_data="admin_manage_methods")
-    b_links = types.InlineKeyboardButton("🔗 تعديل الروابط", callback_data="admin_manage_links")
-    b_broadcast = types.InlineKeyboardButton("📢 إذاعة للمستخدمين", callback_data="admin_broadcast")
-    b_back = types.InlineKeyboardButton("🔙 رجوع للواجهة", callback_data="back_to_main")
-
-    markup.add(b_orders, b_finance)
-    markup.add(b_products)
-    markup.add(b_methods, b_links)
-    markup.add(b_broadcast)
-    markup.add(b_back)
+    b_ord = types.InlineKeyboardButton("📦 الطلبات", callback_data="a_orders")
+    b_fin = types.InlineKeyboardButton("💰 المالية", callback_data="a_finance")
+    b_sta = types.InlineKeyboardButton("📊 الإحصائيات", callback_data="a_stats")
+    b_usr = types.InlineKeyboardButton("👥 المستخدمون", callback_data="a_users")
+    b_prd = types.InlineKeyboardButton("🛍 المنتجات", callback_data="a_products")
+    b_com = types.InlineKeyboardButton("📢 التواصل والإشعارات", callback_data="a_broadcast")
+    b_set = types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="a_settings")
+    b_bck = types.InlineKeyboardButton("🔙 رجوع", callback_data="back_home")
+    
+    markup.add(b_ord, b_fin)
+    markup.add(b_sta, b_usr)
+    markup.add(b_prd, b_com)
+    markup.add(b_set)
+    markup.add(b_bck)
     return markup
 
-# ----------------- أوامر تلغرام -----------------
+def admin_orders_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    b_dep = types.InlineKeyboardButton("💳 طلبات الإيداع", callback_data="a_view_dep_orders")
+    b_shp = types.InlineKeyboardButton("📦 طلبات الشحن", callback_data="a_view_shp_orders")
+    b_fal = types.InlineKeyboardButton("❗️ الطلبات الفاشلة", callback_data="a_view_fail_orders")
+    b_src = types.InlineKeyboardButton("🔍 بحث عن طلب", callback_data="a_search_order")
+    b_bck = types.InlineKeyboardButton("🔙 رجوع", callback_data="back_admin")
+    markup.add(b_dep, b_shp)
+    markup.add(b_fal)
+    markup.add(b_src)
+    markup.add(b_bck)
+    return markup
+
+# ----------------- أوامر البدء -----------------
 
 @bot.message_handler(commands=['start'])
-def start_cmd(message):
-    get_user(message.from_user.id)
+def start_handler(message):
+    user = get_user(message.from_user.id, message.from_user.username)
+    if user['is_banned'] == 1:
+        bot.send_message(message.chat.id, "⛔️ حسابك محظور من استخدام البوت.")
+        return
     bot.send_message(
         message.chat.id,
-        "⚡️ <b>أهلاً بك في بوت الشحن المتكامل</b> ⚡️\nاختر الخدمة المطلوبة من القائمة أدناه:",
-        reply_markup=main_menu()
+        "⚡️ <b>أهلاً بك في بوت الشحن</b> ⚡️",
+        reply_markup=user_main_markup()
     )
 
 @bot.message_handler(commands=['admin'])
-def admin_cmd(message):
+def admin_handler(message):
     if message.from_user.id == ADMIN_ID:
-        bot.send_message(
-            message.chat.id,
-            "🛡 <b>لوحة تحكم الإدارة الشاملة:</b>\nيمكنك التحكم بالأقسام، المنتجات، والأسعار دون الحاجة لتعديل الكود.",
-            reply_markup=admin_panel()
-        )
+        bot.send_message(message.chat.id, "🛡 <b>لوحة التحكم:</b>", reply_markup=admin_main_markup())
     else:
-        bot.reply_to(message, "⛔️ هذا الأمر مخصص لمالك البوت فقط.")
+        bot.reply_to(message, "⛔️ هذا الأمر مخصص للإدارة فقط.")
 
-# ----------------- معالجة أزرار المستخدم -----------------
+# ----------------- قسم المستخدم -----------------
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("user_") or call.data in ["back_to_main"])
-def user_callbacks(call):
-    user_id = call.from_user.id
+@bot.callback_query_handler(func=lambda call: call.data.startswith("u_") or call.data == "back_home")
+def user_flow(call):
+    uid = call.from_user.id
+    user = get_user(uid, call.from_user.username)
+    curr = user['currency']
 
-    if call.data == "back_to_main":
-        bot.edit_message_text(
-            "⚡️ <b>أهلاً بك في بوت الشحن المتكامل</b> ⚡️",
-            call.message.chat.id, call.message.message_id,
-            reply_markup=main_menu()
-        )
+    if call.data == "back_home":
+        bot.edit_message_text("⚡️ <b>أهلاً بك في بوت الشحن</b> ⚡️", call.message.chat.id, call.message.message_id, reply_markup=user_main_markup())
 
-    elif call.data == "user_account":
-        user = get_user(user_id)
+    elif call.data == "u_acc":
+        bal_curr = convert_currency(user['balance'], curr)
         text = (
-            f"👤 <b>معلومات الحساب:</b>\n\n"
-            f"🆔 الآيدي: <code>{user['user_id']}</code>\n"
-            f"💵 الرصيد الحالي: <b>{user['balance']:.2f}$</b>\n"
-            f"🌐 العملة: <b>{user['currency']}</b>"
+            f"👤 <b>حسابي الشخصي</b>\n\n"
+            f"🆔 الآيدي: <code>{uid}</code>\n"
+            f"💵 الرصيد: <b>{bal_curr:,.2f} {curr}</b> (${user['balance']:.2f})\n"
+            f"🌐 العملة المختارة: <b>{curr}</b>"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
+        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_home"))
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-    elif call.data == "user_shop":
+    elif call.data == "u_curr":
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("🇺🇸 USD ($)", callback_data="set_curr_USD"),
+            types.InlineKeyboardButton("🇸🇾 SYP (ل.س)", callback_data="set_curr_SYP"),
+            types.InlineKeyboardButton("🇸🇦 SAR (ر.س)", callback_data="set_curr_SAR"),
+            types.InlineKeyboardButton("🔙 رجوع", callback_data="back_home")
+        )
+        bot.edit_message_text("🌐 <b>اختر العملة المناسبة لعرض الأسعار:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+    elif call.data == "u_shop":
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM categories")
-            categories = cursor.fetchall()
-
-        if not categories:
-            bot.answer_callback_query(call.id, "المتجر فارغ حالياً، قم بإضافة أقسام من لوحة الأدمن.", show_alert=True)
+            cats = conn.cursor().execute("SELECT * FROM categories").fetchall()
+        if not cats:
+            bot.answer_callback_query(call.id, "المتجر فارغ حالياً.", show_alert=True)
             return
-
         markup = types.InlineKeyboardMarkup(row_width=1)
-        for cat in categories:
-            markup.add(types.InlineKeyboardButton(f"📁 {cat['name']}", callback_data=f"cat_{cat['id']}"))
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
+        for c in cats:
+            markup.add(types.InlineKeyboardButton(f"🎁 {c['name']}", callback_data=f"open_cat_{c['id']}"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_home"))
         bot.edit_message_text("🛍 <b>اختر القسم المطلوب للتسوق:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-    elif call.data == "user_deposit":
+    elif call.data == "u_deposit":
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM payment_methods")
-            methods = cursor.fetchall()
-
+            methods = conn.cursor().execute("SELECT * FROM payment_methods").fetchall()
         if not methods:
-            bot.answer_callback_query(call.id, "لم تتم إضافة طرق شحن بعد. أضفها من لوحة الأدمن.", show_alert=True)
+            bot.answer_callback_query(call.id, "لا تتوفر وسائل دفع حالياً.", show_alert=True)
             return
-
         markup = types.InlineKeyboardMarkup(row_width=1)
         for m in methods:
-            markup.add(types.InlineKeyboardButton(f"💳 {m['title']}", callback_data=f"pay_{m['id']}"))
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-        bot.edit_message_text("💰 <b>اختر وسيلة الإيداع والشحن:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            markup.add(types.InlineKeyboardButton(f"💳 {m['title']}", callback_data=f"open_pm_{m['id']}"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_home"))
+        bot.edit_message_text("💰 <b>اختر وسيلة الإيداع وشحن الرصيد:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("cat_"))
-def view_category_products(call):
-    cat_id = call.data.split("_")[1]
+# تغيير العملة
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_curr_"))
+def change_curr(call):
+    new_curr = call.data.split("_")[2]
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM products WHERE category_id = ?", (cat_id,))
-        products = cursor.fetchall()
+        conn.cursor().execute("UPDATE users SET currency = ? WHERE user_id = ?", (new_curr, call.from_user.id))
+        conn.commit()
+    bot.answer_callback_query(call.id, f"✅ تم تغيير العملة إلى {new_curr}")
+    start_handler(call.message)
+
+# تصفح أقسام ومنتجات المتجر
+@bot.callback_query_handler(func=lambda call: call.data.startswith("open_cat_"))
+def show_cat_prods(call):
+    cat_id = call.data.split("_")[2]
+    user = get_user(call.from_user.id)
+    curr = user['currency']
+
+    with get_db() as conn:
+        prods = conn.cursor().execute("SELECT * FROM products WHERE category_id = ?", (cat_id,)).fetchall()
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    if products:
-        for p in products:
-            markup.add(types.InlineKeyboardButton(f"{p['name']} | {p['price']}$", callback_data=f"buy_{p['id']}"))
-    else:
-        markup.add(types.InlineKeyboardButton("لا توجد باقات متوفرة هنا", callback_data="none"))
+    for p in prods:
+        p_price = convert_currency(p['price'], curr)
+        markup.add(types.InlineKeyboardButton(f"{p['name']} ➔ {p_price:,.2f} {curr}", callback_data=f"buy_p_{p['id']}"))
+    markup.add(types.InlineKeyboardButton("🔙 رجوع للأقسام", callback_data="u_shop"))
+    bot.edit_message_text("📦 <b>اختر الباقة للشحن المباشر:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-    markup.add(types.InlineKeyboardButton("🔙 رجوع للأقسام", callback_data="user_shop"))
-    bot.edit_message_text("📦 <b>اختر الباقة للشراء:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def show_payment_info(call):
-    method_id = call.data.split("_")[1]
+# الشراء وإدخال الآيدي
+@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_p_"))
+def process_buy_prod(call):
+    pid = call.data.split("_")[2]
+    user = get_user(call.from_user.id)
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM payment_methods WHERE id = ?", (method_id,))
-        method = cursor.fetchone()
+        p = conn.cursor().execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+
+    if user['balance'] < p['price']:
+        bot.answer_callback_query(call.id, f"⚠️ رصيدك غير كافٍ! سعر الباقة ${p['price']} ورصيدك ${user['balance']:.2f}", show_alert=True)
+        return
+
+    msg = bot.send_message(call.message.chat.id, f"🎯 لتأكيد طلب باقة <b>{p['name']}</b>:\nأرسل الآن <b>{p['input_hint']}</b> الخاص بك في المحادثة:")
+    bot.register_next_step_handler(msg, complete_order, p)
+
+def complete_order(message, product):
+    uid = message.from_user.id
+    target_id = message.text.strip()
+    user = get_user(uid)
+
+    if user['balance'] < product['price']:
+        bot.reply_to(message, "❌ رصيدك أصبح غير كافٍ، تم إلغاء العملية.")
+        return
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (product['price'], uid))
+        c.execute("INSERT INTO orders (user_id, type, item_name, target_id, amount, status) VALUES (?, 'charge', ?, ?, ?, 'pending')",
+                  (uid, product['name'], target_id, product['price']))
+        order_id = c.lastrowid
+        conn.commit()
+
+    bot.send_message(uid, f"✅ <b>تم استلام طلبك بنجاح!</b>\n📦 الطلب: {product['name']}\n🆔 الحساب المستهدف: <code>{target_id}</code>\n🔢 رقم الطلب: <code>#{order_id}</code>\nسيصلك إشعار فور تنفيذه.", reply_markup=user_main_markup())
+
+    # إشعار الأدمن فورياً مع أزرار التحكم
+    adm_markup = types.InlineKeyboardMarkup(row_width=2)
+    adm_markup.add(
+        types.InlineKeyboardButton("✅ تم التنفيذ", callback_data=f"adm_done_ord_{order_id}"),
+        types.InlineKeyboardButton("❌ إلغاء وإرجاع الرصيد", callback_data=f"adm_fail_ord_{order_id}")
+    )
+    bot.send_message(
+        ADMIN_ID,
+        f"🚨 <b>طلب شحن جديد #{order_id}</b>\n👤 المستخدم: <code>{uid}</code>\n📦 الباقة: <b>{product['name']}</b>\n🎮 الآيدي: <code>{target_id}</code>\n💵 السعر: ${product['price']}",
+        reply_markup=adm_markup
+    )
+
+# ----------------- نظام الإيداع بالصور والإيصالات -----------------
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("open_pm_"))
+def deposit_method_details(call):
+    mid = call.data.split("_")[2]
+    with get_db() as conn:
+        m = conn.cursor().execute("SELECT * FROM payment_methods WHERE id = ?", (mid,)).fetchone()
 
     text = (
-        f"💳 <b>طريقة الإيداع: {method['title']}</b>\n\n"
-        f"📋 <b>التعليمات:</b>\n{method['instructions']}\n\n"
-        f"⚠️ بعد التحويل، يرجى إرسال الإشعار أو رقم المعاملة للدعم لتفعيل الرصيد."
+        f"💳 <b>طريقة الإيداع: {m['title']}</b>\n\n"
+        f"📋 <b>بيانات التحويل:</b>\n{m['details']}\n\n"
+        f"📌 بعد إتمام التحويل، اضغط الزر أدناه لإرسال الإيصال وتأكيد الإيداع."
     )
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 رجوع لطرق الدفع", callback_data="user_deposit"))
+    markup.add(types.InlineKeyboardButton("📤 إرسال إشعار الدفع الآن", callback_data=f"dep_send_{mid}"))
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="u_deposit"))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
-# ----------------- أوامر لوحة الأدمن -----------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("dep_send_"))
+def prompt_receipt(call):
+    msg = bot.send_message(call.message.chat.id, "💵 اكتب المبلغ المحول بالدولار ($) أولاً:\n(مثال: <code>5</code> أو <code>10.5</code>)")
+    bot.register_next_step_handler(msg, step_get_amount)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_") or call.data in ["back_to_admin"])
-def admin_callbacks(call):
+def step_get_amount(message):
+    try:
+        amount = float(message.text.strip())
+        msg = bot.send_message(message.chat.id, "📸 ممتاز، الآن <b>أرسل صورة إشعار التحويل (سكرين شوت)</b> هنا:")
+        bot.register_next_step_handler(msg, step_get_photo, amount)
+    except:
+        bot.reply_to(message, "❌ خطأ في كتابة المبلغ، أعد المحاولة من قائمة الإيداع.")
+
+def step_get_photo(message, amount):
+    if not message.photo:
+        bot.reply_to(message, "❌ يرجى إرسال صورة للإشعار حصراً.")
+        return
+
+    photo_id = message.photo[-1].file_id
+    uid = message.from_user.id
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO orders (user_id, type, item_name, target_id, amount, status) VALUES (?, 'deposit', 'طلب إيداع', ?, ?, 'pending')",
+                  (uid, "تحويل يدوي", amount))
+        dep_id = c.lastrowid
+        conn.commit()
+
+    bot.reply_to(message, f"✅ تم إرسال إشعار الدفع للإدارة (طلب رقم #{dep_id}).\nسيتم فحص الإيصال وإضافة الرصيد لحسابك قريباً.")
+
+    # إرسال الصورة للأدمن مع زري الموافقة والرفض
+    adm_markup = types.InlineKeyboardMarkup(row_width=2)
+    adm_markup.add(
+        types.InlineKeyboardButton("✅ قبول وإيداع الرصيد", callback_data=f"acc_dep_{dep_id}"),
+        types.InlineKeyboardButton("❌ رفض الإيصال", callback_data=f"rej_dep_{dep_id}")
+    )
+    bot.send_photo(
+        ADMIN_ID,
+        photo_id,
+        caption=f"💳 <b>طلب إيداع جديد #{dep_id}</b>\n👤 من: <code>{uid}</code>\n💵 المبلغ: <b>${amount}</b>",
+        reply_markup=adm_markup
+    )
+
+# معالجة قبول أو رفض الإيداع والشحن من قبل الأدمن
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("acc_dep_", "rej_dep_", "adm_done_ord_", "adm_fail_ord_")))
+def handle_admin_actions(call):
     if call.from_user.id != ADMIN_ID:
         return
 
-    if call.data == "back_to_admin":
-        bot.edit_message_text("🛡 <b>لوحة تحكم الإدارة الشاملة:</b>", call.message.chat.id, call.message.message_id, reply_markup=admin_panel())
+    action, _, oid = call.data.rpartition("_")
+    oid = int(oid)
 
-    elif call.data == "admin_manage_shop":
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("➕ إضافة قسم جديد (زر)", callback_data="adm_add_cat"),
-            types.InlineKeyboardButton("➕ إضافة باقة / منتج داخل قسم", callback_data="adm_add_prod"),
-            types.InlineKeyboardButton("🔙 رجوع للوحة التحكم", callback_data="back_to_admin")
-        )
-        bot.edit_message_text("🛍 <b>إدارة الأقسام والمنتجات:</b>\nاختر العملية المطلوبة:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-    elif call.data == "admin_manage_methods":
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("➕ إضافة طريقة إيداع", callback_data="adm_add_method"),
-            types.InlineKeyboardButton("🔙 رجوع للوحة التحكم", callback_data="back_to_admin")
-        )
-        bot.edit_message_text("💳 <b>إدارة طرق الإيداع:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-    elif call.data == "admin_manage_links":
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("✏️ تعديل رابط الدعم الفني", callback_data="adm_edit_support"),
-            types.InlineKeyboardButton("✏️ تعديل رابط قناة الأخبار", callback_data="adm_edit_news"),
-            types.InlineKeyboardButton("🔙 رجوع للوحة التحكم", callback_data="back_to_admin")
-        )
-        bot.edit_message_text("🔗 <b>تعديل الروابط الخارجية للبوت:</b>", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-    elif call.data == "admin_finance":
-        msg = bot.send_message(call.message.chat.id, "أرسل آيدي المستخدم والمبلغ لإضافته بالشكل التالي:\n<code>ID AMOUNT</code>\nمثال:\n<code>123456789 10</code>")
-        bot.register_next_step_handler(msg, process_add_balance)
-
-@bot.callback_query_handler(func=lambda call: call.data == "adm_add_cat")
-def adm_add_cat_prompt(call):
-    msg = bot.send_message(call.message.chat.id, "أرسل اسم القسم الجديد (مثلاً: <b>ببجي موبايل</b>):")
-    bot.register_next_step_handler(msg, save_category)
-
-def save_category(message):
-    cat_name = message.text.strip()
     with get_db() as conn:
-        conn.cursor().execute("INSERT INTO categories (name) VALUES (?)", (cat_name,))
-        conn.commit()
-    bot.reply_to(message, f"✅ تم إنشاء القسم: <b>{cat_name}</b> بنجاح.", reply_markup=admin_panel())
+        c = conn.cursor()
+        order = c.execute("SELECT * FROM orders WHERE id = ?", (oid,)).fetchone()
+        if not order or order['status'] != 'pending':
+            bot.answer_callback_query(call.id, "تم اتخاذ إجراء مسبق على هذا الطلب!", show_alert=True)
+            return
 
-@bot.callback_query_handler(func=lambda call: call.data == "adm_add_prod")
-def adm_add_prod_prompt(call):
-    with get_db() as conn:
-        categories = conn.cursor().execute("SELECT * FROM categories").fetchall()
-    
-    if not categories:
-        bot.send_message(call.message.chat.id, "⚠️ يجب إضافة قسم أولاً.")
+        if "acc_dep" in call.data:
+            c.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
+            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (order['amount'], order['user_id']))
+            conn.commit()
+            bot.send_message(order['user_id'], f"🎉 <b>تم تأكيد إيداعك بنجاح!</b>\nتمت إضافة <b>${order['amount']}</b> إلى رصيدك.")
+            bot.edit_message_caption(f"✅ تم قبول الإيداع #{oid} وإضافة ${order['amount']} للمستخدم.", call.message.chat.id, call.message.message_id)
+
+        elif "rej_dep" in call.data:
+            c.execute("UPDATE orders SET status = 'failed' WHERE id = ?", (oid,))
+            conn.commit()
+            bot.send_message(order['user_id'], f"❌ نعتذر، تم رفض طلب الإيداع #{oid}. تواصل مع الدعم الفني لمزيد من التفاصيل.")
+            bot.edit_message_caption(f"❌ تم رفض الإيداع #{oid}.", call.message.chat.id, call.message.message_id)
+
+        elif "adm_done_ord" in call.data:
+            c.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
+            conn.commit()
+            bot.send_message(order['user_id'], f"✅ <b>تم تنفيذ طلب الشحن بنجاح!</b>\n📦 الطلب: {order['item_name']}\n🎮 الآيدي: <code>{order['target_id']}</code>\nشكراً لتعاملك معنا!")
+            bot.edit_message_text(f"✅ تم تأكيد إكمال الطلب #{oid}.", call.message.chat.id, call.message.message_id)
+
+        elif "adm_fail_ord" in call.data:
+            c.execute("UPDATE orders SET status = 'failed' WHERE id = ?", (oid,))
+            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (order['amount'], order['user_id']))
+            conn.commit()
+            bot.send_message(order['user_id'], f"⚠️ تعذر تنفيذ طلب الشحن #{oid}.\nتمت إعادة المبلغ (${order['amount']}) إلى محفظتك بالكامل.")
+            bot.edit_message_text(f"❌ تم إلغاء الطلب #{oid} واسترجاع الرصيد للعميل.", call.message.chat.id, call.message.message_id)
+
+# ----------------- لوحة تحكم الأدمن التفصيلية -----------------
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("a_") or call.data == "back_admin")
+def admin_nav(call):
+    if call.from_user.id != ADMIN_ID:
         return
 
-    text = "اختر رقم القسم لإضافة المنتج إليه:\n\n"
-    for c in categories:
-        text += f"ID: <code>{c['id']}</code> ➔ <b>{c['name']}</b>\n"
-    text += "\nأرسل بالشكل:\n<code>ID_القسم | اسم المنتج | السعر</code>\nمثال:\n<code>1 | 60 شدة | 0.99</code>"
-    
-    msg = bot.send_message(call.message.chat.id, text)
-    bot.register_next_step_handler(msg, save_product)
+    if call.data == "back_admin":
+        bot.edit_message_text("🛡 <b>لوحة التحكم:</b>", call.message.chat.id, call.message.message_id, reply_markup=admin_main_markup())
 
-def save_product(message):
-    try:
-        cat_id, name, price = [x.strip() for x in message.text.split("|")]
+    elif call.data == "a_orders":
+        bot.edit_message_text("📦 <b>قسم الطلبات:</b>\nاختر نوع الطلب:", call.message.chat.id, call.message.message_id, reply_markup=admin_orders_markup())
+
+    elif call.data == "a_stats":
         with get_db() as conn:
-            conn.cursor().execute("INSERT INTO products (category_id, name, price) VALUES (?, ?, ?)", (int(cat_id), name, float(price)))
-            conn.commit()
-        bot.reply_to(message, f"✅ تم إضافة المنتج: <b>{name}</b> بسعر <b>{price}$</b>", reply_markup=admin_panel())
-    except Exception:
-        bot.reply_to(message, "❌ خطأ في الصيغة. يرجى إرسالها مفصولة برمز |.")
+            c = conn.cursor()
+            u_count = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            ord_count = c.execute("SELECT COUNT(*) FROM orders WHERE type = 'charge' AND status = 'completed'").fetchone()[0]
+            sales = c.execute("SELECT SUM(amount) FROM orders WHERE type = 'charge' AND status = 'completed'").fetchone()[0] or 0.0
+            deps = c.execute("SELECT SUM(amount) FROM orders WHERE type = 'deposit' AND status = 'completed'").fetchone()[0] or 0.0
 
-@bot.callback_query_handler(func=lambda call: call.data == "adm_add_method")
-def adm_add_method_prompt(call):
-    msg = bot.send_message(call.message.chat.id, "أرسل اسم طريقة الدفع والتعليمات مفصولة برمز |\nمثال:\n<code>سيريتل كاش | حول للرقم 09xxxxxxxx ثم ارسل الإشعار</code>")
-    bot.register_next_step_handler(msg, save_payment_method)
-
-def save_payment_method(message):
-    try:
-        title, instructions = [x.strip() for x in message.text.split("|")]
-        with get_db() as conn:
-            conn.cursor().execute("INSERT INTO payment_methods (title, instructions) VALUES (?, ?)", (title, instructions))
-            conn.commit()
-        bot.reply_to(message, f"✅ تمت إضافة طريقة الدفع: <b>{title}</b>", reply_markup=admin_panel())
-    except Exception:
-        bot.reply_to(message, "❌ خطأ في الصيغة! الرجاء وضع الرمز | بين العنوان والتعليمات.")
-
-@bot.callback_query_handler(func=lambda call: call.data in ["adm_edit_support", "adm_edit_news"])
-def edit_link_prompt(call):
-    link_type = "support_url" if call.data == "adm_edit_support" else "news_url"
-    msg = bot.send_message(call.message.chat.id, "أرسل الرابط الجديد كاملاً (يبدأ بـ https://):")
-    bot.register_next_step_handler(msg, lambda m: save_link(m, link_type))
-
-def save_link(message, link_type):
-    url = message.text.strip()
-    with get_db() as conn:
-        conn.cursor().execute("UPDATE settings SET value = ? WHERE key = ?", (url, link_type))
-        conn.commit()
-    bot.reply_to(message, "✅ تم تحديث الرابط بنجاح!", reply_markup=admin_panel())
-
-def process_add_balance(message):
-    try:
-        user_id, amount = message.text.strip().split()
-        user_id = int(user_id)
-        amount = float(amount)
-        with get_db() as conn:
-            conn.cursor().execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-            conn.commit()
-        bot.reply_to(message, f"✅ تم إضافة <b>{amount}$</b> لحساب المستخدم <code>{user_id}</code>.")
-        bot.send_message(user_id, f"🎉 تم إيداع <b>{amount}$</b> في محفظتك بنجاح!")
-    except Exception:
-        bot.reply_to(message, "❌ فشل التحديث. أرسل الآيدي ثم مسافة ثم المبلغ.")
-
-# ----------------- تشغيل البوت -----------------
-if __name__ == "__main__":
-    bot.infinity_polling()
-        
